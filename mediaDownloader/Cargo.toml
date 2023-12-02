@@ -1,0 +1,49 @@
+[package]
+name = "mediadownloader"
+version = "1.0.0"
+edition = "2021"
+
+[[bin]]
+name = "media_downloader"
+path = "src/media_downloader/media_downloader.rs"
+
+[[bin]]
+name = "cleaner"
+path = "src/cleaner/cleaner.rs"
+
+[[bin]]
+name = "bot"
+path = "src/bot/client.rs"
+
+[dependencies]
+tokio = { version = "1.26", features = ["full", "tracing"] }
+env_logger = "0.10.0"
+futures = "0.3.25"
+serde = { version = "1.0.157", features = ["derive"] }
+toml = "0.7.2"
+url = "2.3.1"
+redis = { version = "0.23.1", features = [
+    "tokio-rustls-comp",
+    "connection-manager",
+] }
+lazy_static = "1.4.0"
+frankenstein = { version = "0.24.1", default-features = false, features = [
+    "async-http-client",
+] }
+tracing = { version = "0.1.37", features = ["attributes"] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+deadpool-redis = { version = "0.12.0", features = ["rt_tokio_1"] }
+async_once = "0.2.6"
+opentelemetry = { version = "0.20.0", default-features = false, features = [
+    "trace",
+    "metrics",
+    "rt-tokio",
+] }
+opentelemetry-otlp = { version = "0.13.0", features = [
+    "http-proto",
+    "reqwest-client",
+    "reqwest-rustls",
+] }
+tracing-bunyan-formatter = "0.3.9"
+tracing-opentelemetry = "0.21.0"
+opentelemetry-semantic-conventions = "0.12.0"
