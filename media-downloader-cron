@@ -1,0 +1,1 @@
+0 0 * * * cd /home/mediaDownloader/ && ./cleaner && curl -sS --retry 2 -o /dev/null https://hc-ping.com/${HC_UUID_CLEANER}

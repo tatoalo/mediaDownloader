@@ -1,0 +1,16 @@
+[telegram]
+token = "token"
+
+[redis]
+username = "username"
+password = "password"
+host = "host"
+port = 6942
+channel = "channel"
+
+[supported_sites]
+sites = ["site1.com", "site2.com"]
+
+[telemetry]
+endpoint = "endpoint"
+api_key = "api_key"
