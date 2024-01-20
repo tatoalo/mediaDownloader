@@ -1,4 +1,4 @@
-use crate::{media_downloader::video_formatter, TIKTOK_DOMAIN, YOUTUBE_MOBILE};
+use crate::{media_downloader::formatter, TIKTOK_MOBILE_DOMAIN, YOUTUBE_MOBILE};
 use std::error::Error;
 use url::Url;
 
@@ -21,7 +21,7 @@ impl UrlFormatter {
                 match Self::extract_domain(u.as_str()) {
                     Some(domain) => {
                         debug!("Extracted domain `{}`", domain);
-                        Self::Valid(u, video_formatter::DomainExtracted::Domain(domain))
+                        Self::Valid(u, formatter::DomainExtracted::Domain(domain))
                     }
                     None => {
                         error!("Could not extract domain from `{}`", url);
@@ -50,7 +50,7 @@ impl UrlFormatter {
     pub fn get_domain_string(&self) -> Result<&str, Box<dyn Error>> {
         match self {
             Self::Valid(_, d) => match d {
-                video_formatter::DomainExtracted::Domain(domain) => Ok(domain.as_str()),
+                formatter::DomainExtracted::Domain(domain) => Ok(domain.as_str()),
             },
             Self::NotValid => Err("URL is not valid".into()),
         }
@@ -62,7 +62,7 @@ impl UrlFormatter {
             Err(_) => return None,
         };
         let host = parsed_url.host_str().unwrap();
-        if (host.contains("www") && !host.eq(YOUTUBE_MOBILE)) || host.eq(TIKTOK_DOMAIN) {
+        if (host.contains("www") && !host.eq(YOUTUBE_MOBILE)) || host.eq(TIKTOK_MOBILE_DOMAIN) {
             let domain = host.split('.').skip(1).collect::<Vec<&str>>();
             return Some(domain.join("."));
         }
@@ -72,7 +72,7 @@ impl UrlFormatter {
 }
 
 #[cfg(test)]
-mod video_formatter_tests {
+mod formatter_tests {
     use super::*;
 
     #[test]

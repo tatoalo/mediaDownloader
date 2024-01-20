@@ -1,8 +1,11 @@
 use std::sync::Arc;
 
 use mediadownloader::{
-    get_redis_manager, media_downloader::site_validator::SupportedSites, reply_message,
-    services::RedisManager, BotMessage, CONFIG_FILE_SYNC, REDIS_CHANNEL, TELEGRAM_CONFIG,
+    get_redis_manager,
+    media_downloader::site_validator::SupportedSites,
+    reply_message,
+    services::{init_telemetry, RedisManager},
+    BotMessage, CONFIG_FILE_SYNC, REDIS_CHANNEL, TELEGRAM_CONFIG,
 };
 
 use frankenstein::{
@@ -20,7 +23,7 @@ pub enum BotCommands {
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    init_telemetry(Some("bot".to_string())).await;
 
     info!("Starting bot...");
 
@@ -90,6 +93,7 @@ async fn process_message(message: Message, redis_manager: &RedisManager, api: As
                     message.chat.id,
                     message.message_id,
                     Some(error_message_text),
+                    None,
                     None,
                     api,
                 )

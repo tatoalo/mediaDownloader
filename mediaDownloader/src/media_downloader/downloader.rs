@@ -5,8 +5,9 @@ use std::process::{Command, Stdio};
 use tracing::instrument;
 
 use super::errors::MediaDownloaderError;
+use crate::TARGET_DIRECTORY_IMAGES;
 use crate::{
-    get_redis_manager, media_downloader::video_formatter::UrlFormatter, TARGET_DIRECTORY,
+    get_redis_manager, media_downloader::formatter::UrlFormatter, TARGET_DIRECTORY,
     VIDEO_EXTENSIONS_FORMAT,
 };
 
@@ -14,21 +15,18 @@ use crate::{
 /// If the video was already downloaded, it will return the video ID directly
 /// # Arguments
 /// * `url` - The `UrlFormatter` to download
-/// # Returns
-/// * `Result<&str, Box<dyn Error + Send + Sync>>` - The video ID
+/// * `url_id` - The ID of the video
 #[instrument(level = "debug", name = "download_video")]
-pub async fn download_video(url: &UrlFormatter) -> Result<&str, Box<dyn Error + Send + Sync>> {
+pub async fn download_video(
+    url: &UrlFormatter,
+    url_id: String,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
     let url = url.get_url_string().unwrap();
 
-    let url_id = url
-        .split('/')
-        .last()
-        .ok_or_else(|| MediaDownloaderError::CouldNotExtractId)?;
-
-    match was_video_already_downloaded(url_id).await {
+    match was_video_already_downloaded(&url_id).await {
         true => {
             debug!("Video already downloaded!");
-            return Ok(url_id);
+            return Ok(());
         }
         false => {}
     }
@@ -69,7 +67,7 @@ pub async fn download_video(url: &UrlFormatter) -> Result<&str, Box<dyn Error + 
         .filter(|line| line.contains("[download]"))
         .for_each(|line| debug!("{}", line));
 
-    Ok(url_id)
+    Ok(())
 }
 
 /// From a URL ID, verify that the key is already present in Redis
@@ -93,4 +91,43 @@ pub async fn was_video_already_downloaded(url_id: &str) -> bool {
             return false;
         }
     }
+}
+
+/// From a URL ID and counter, verify that the key is already present in Redis
+/// If it is not, it will be set
+/// # Arguments
+/// * `url_id` - The ID of the image
+/// * `c` - The counter of the image
+/// # Returns
+/// * `bool` - Whether the image was already downloaded or not
+#[instrument(level = "debug", name = "was_image_already_downloaded")]
+pub async fn was_image_already_downloaded(url_id: &str, c: i32) -> bool {
+    let redis_manager = get_redis_manager().await;
+    let key = &format!("{}_{}", url_id, c);
+
+    println!("Looking up key: {:?}", key);
+
+    let output_path = format!(
+        "{}{}{}_{}.jpeg",
+        TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES, url_id, c
+    );
+
+    match redis_manager.get(key).await {
+        Ok(_) => {
+            println!("Key: {:?} present!", key);
+            true
+        }
+        Err(e) => {
+            println!("Key: {:?} not present!", key);
+            warn!("Key: {:?} not present ~ {:?} ", key, e);
+            debug!("Setting key {} to {}", key, output_path);
+            let _ = redis_manager.set(key, &output_path).await;
+            return false;
+        }
+    }
+}
+
+pub async fn fetch_resource(url: &str) -> Result<reqwest::Response, reqwest::Error> {
+    let response = reqwest::get(url).await?;
+    Ok(response)
 }

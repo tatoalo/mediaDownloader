@@ -9,7 +9,7 @@ RUN cargo build --release
 
 #########################################
 
-FROM alpine:edge
+FROM alpine:3.19
 
 ENV TZ=Europe/Paris
 ENV RUST_LOG=media_downloader=debug,bot=debug,cleaner=debug

@@ -6,8 +6,19 @@
     unreachable_code
 )]
 
-use frankenstein::InputFile;
+use frankenstein::{FileUpload, InputFile, InputMediaPhoto, Media};
 use futures::{StreamExt, TryFutureExt};
+use mediadownloader::media_downloader::processors::{route_to_processor, Processor, ProcessorType};
+use mediadownloader::media_downloader::{
+    downloader::download_video, errors::MediaDownloaderError, formatter::UrlFormatter,
+    site_validator::SupportedSites,
+};
+use mediadownloader::services::init_telemetry;
+use mediadownloader::{
+    extract_id_from_url, get_redis_manager, human_file_size, reply_message, BotMessage,
+    MessageContent, MessageHandled, CONFIG_FILE_SYNC, IMAGE_EXTENSIONS_FORMAT, MAX_FILE_SIZE,
+    MAX_FILE_SIZE_PHOTO, TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES, VIDEO_EXTENSIONS_FORMAT,
+};
 use std::{
     error::Error,
     fs,
@@ -15,16 +26,6 @@ use std::{
     sync::Arc,
 };
 use tokio::{fs::File, io::AsyncReadExt};
-
-use mediadownloader::media_downloader::{
-    errors::MediaDownloaderError, site_validator::SupportedSites, video_downloader::download_video,
-    video_formatter::UrlFormatter,
-};
-use mediadownloader::services::init_telemetry;
-use mediadownloader::{
-    get_redis_manager, human_file_size, reply_message, BotMessage, CONFIG_FILE_SYNC, MAX_FILE_SIZE,
-    TARGET_DIRECTORY, VIDEO_EXTENSIONS_FORMAT,
-};
 use tracing::{debug, error, info, instrument, span};
 
 /// Removes a directory recursively (`DEBUG` only!)
@@ -91,19 +92,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             match handle_received_message(&bot_message_deserialized.url, &supported_sites_arc_clone)
                 .await
             {
-                Ok(file) => {
+                Ok(message) => {
                     let _enter = root_span.enter();
-                    reply_message(
-                        bot_message_deserialized.chat_id,
-                        bot_message_deserialized.message_id,
-                        None,
-                        Some(file),
-                        bot_message_deserialized.api,
-                    )
-                    .unwrap_or_else(|e| {
-                        error!("Failed to send reply: {:?}", e);
-                    })
-                    .await;
+                    match message.content {
+                        Some(MessageContent::File(file)) => {
+                            reply_message(
+                                bot_message_deserialized.chat_id,
+                                bot_message_deserialized.message_id,
+                                None,
+                                Some(file),
+                                None,
+                                bot_message_deserialized.api.clone(),
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to send reply: {:?}", e);
+                            });
+                        }
+                        Some(MessageContent::Images(images)) => {
+                            debug!("Ready to Send bulk photos");
+                            reply_message(
+                                bot_message_deserialized.chat_id,
+                                bot_message_deserialized.message_id,
+                                None,
+                                None,
+                                Some(images),
+                                bot_message_deserialized.api.clone(),
+                            )
+                            .await
+                            .unwrap_or_else(|e| {
+                                error!("Failed to send reply: {:?}", e);
+                            });
+                        }
+                        None => {
+                            error!(
+                                "MessageContent is not populated correctly ~ {:?}",
+                                message.content
+                            );
+                        }
+                    }
                 }
                 Err(e) => {
                     let _enter = root_span.enter();
@@ -114,7 +141,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         bot_message_deserialized.message_id,
                         Some(err_msg),
                         None,
-                        bot_message_deserialized.api,
+                        None,
+                        bot_message_deserialized.api.clone(),
                     )
                     .unwrap_or_else(|e| {
                         error!("Failed to send error reply: {:?}", e);
@@ -145,7 +173,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 async fn handle_received_message(
     message_url: &str,
     supported_sites: &Arc<SupportedSites>,
-) -> Result<InputFile, Box<dyn Error + Send>> {
+) -> Result<MessageHandled, Box<dyn Error + Send>> {
     let url_formatted = UrlFormatter::new(message_url);
 
     match &url_formatted {
@@ -154,11 +182,48 @@ async fn handle_received_message(
                 debug!("`{:?}` is NOT supported!", d);
                 return Err(Box::new(MediaDownloaderError::UnsupportedDomain));
             } else {
-                match download_video(&url_formatted).await {
-                    Ok(url_id) => {
+                let url_id = extract_id_from_url(message_url).unwrap();
+                let processor = route_to_processor(&message_url, url_id);
+
+                match processor {
+                    Some(ProcessorType::TikTok(mut tiktok_processor)) => {
+                        debug!("TikTok processor!");
+                        tiktok_processor.process().await;
+                        if tiktok_processor.is_video() {
+                            debug!("TikTok video!");
+                        } else {
+                            debug!("TikTok slideshow! ~ ID[{}]", tiktok_processor.get_id());
+                            let url_id = tiktok_processor.get_id();
+                            let number_of_images = tiktok_processor.get_number_images();
+                            let hits = tiktok_processor.get_hits();
+
+                            match retrieve_images(&url_id, number_of_images, hits).await {
+                                Ok(images) => {
+                                    return Ok(MessageHandled {
+                                        content: Some(MessageContent::Images(images)),
+                                    });
+                                }
+                                Err(e) => {
+                                    error!("Error retrieving images: {:?}", e);
+                                    return Err(e);
+                                }
+                            }
+                        }
+                    }
+                    _ => {
+                        debug!("Not a TikTok resource!")
+                    }
+                };
+
+                match download_video(&url_formatted, url_id.to_string()).await {
+                    Ok(_) => {
                         debug!("Successfully obtained video: `{}`", message_url);
-                        match retrieve_blob(url_id).await {
-                            Ok(file) => Ok(file),
+                        match retrieve_blob(&url_id).await {
+                            Ok(file) => {
+                                return Ok(MessageHandled {
+                                    content: Some(MessageContent::File(file)),
+                                })
+                            }
                             Err(e) => {
                                 error!("Error retrieving video: {:?}", e);
                                 return Err(e);
@@ -222,4 +287,95 @@ async fn retrieve_blob(url_id: &str) -> Result<InputFile, Box<dyn Error + Send>>
     Ok(InputFile {
         path: PathBuf::from(&file_path),
     })
+}
+
+// Asynchronously retrieves a specified number of images.
+///
+/// # Arguments
+///
+/// * `url_id` - A string slice that holds the identifier of the URL from which to retrieve images.
+/// * `number_of_images` - The number of images to retrieve.
+///
+/// # Returns
+///
+/// * `Ok(Vec<Media>)` - A vector of `Media` objects, each representing an image, if the images are successfully retrieved.
+/// * `Err(Box<dyn Error + Send>)` - An error, if any occurred during the retrieval of images.
+///
+/// # Errors
+///
+/// This function will return an error if the images cannot be retrieved for any reason (e.g., network issues, invalid URL ID, etc.).
+#[instrument(level = "debug", name = "retrieve_images", skip(url_id))]
+async fn retrieve_images(
+    url_id: &str,
+    number_of_images: i32,
+    hits: &Vec<String>,
+) -> Result<Vec<Media>, Box<dyn Error + Send>> {
+    let mut images = Vec::<Media>::new();
+    let mut io_errors = 0;
+
+    println!("hits: {}", hits.len() as i32);
+    println!("number_of_images: {}", number_of_images);
+
+    for n in 0..number_of_images {
+        let image_file_name = format!("{}_{}", url_id, n);
+
+        let file_path = format!(
+            "{}{}{}.{}",
+            TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES, image_file_name, IMAGE_EXTENSIONS_FORMAT
+        );
+        debug!(
+            "Retrieving image for {} in path {}",
+            image_file_name, file_path
+        );
+
+        let mut file = match File::open(&file_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Error opening file `{}`: {}", file_path, e);
+                debug!("Removing key `{}`", image_file_name);
+                let redis_manager = get_redis_manager().await;
+                let _ = redis_manager.del(&image_file_name).await;
+                io_errors += 1;
+                continue;
+            }
+        };
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).await.unwrap();
+        let file_size = buffer.len() as u64;
+
+        if file_size > MAX_FILE_SIZE_PHOTO {
+            error!(
+                "File size of {} [{}] is greater than {}!",
+                url_id, file_size, MAX_FILE_SIZE_PHOTO
+            );
+            continue;
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            let file_size_h = human_file_size(file_size);
+            debug!("file size of {} = {}", url_id, file_size_h);
+        }
+
+        images.push(Media::Photo(InputMediaPhoto {
+            media: FileUpload::InputFile(InputFile {
+                path: PathBuf::from(&file_path),
+            }),
+            caption: None,
+            parse_mode: None,
+            caption_entities: None,
+            has_spoiler: None,
+        }));
+    }
+
+    if images.is_empty() {
+        return Err(Box::new(MediaDownloaderError::ImagesNotDownloaded));
+    }
+
+    debug!("Finished retrieving images!");
+    if io_errors > 0 {
+        debug!("Encountered {} IO errors", io_errors);
+    }
+    Ok(images)
 }
