@@ -14,12 +14,21 @@ pub mod media_downloader;
 pub mod services;
 
 use async_once::AsyncOnce;
-use frankenstein::{AsyncApi, AsyncTelegramApi, InputFile, SendMessageParams, SendVideoParams};
+use frankenstein::{
+    AsyncApi, AsyncTelegramApi, InputFile, Media, SendMediaGroupParams, SendMessageParams,
+    SendVideoParams,
+};
 use lazy_static::lazy_static;
-use media_downloader::site_validator::SupportedSites;
+use media_downloader::{errors::MediaDownloaderError, site_validator::SupportedSites};
 use serde::{ser::SerializeMap, Deserialize, Serialize};
 use services::{Builder, RedisBuilder, RedisConfig, RedisManager, TelemetryConfig};
 use std::error::Error;
+
+#[derive(Debug)]
+pub enum MessageContent {
+    File(InputFile),
+    Images(Vec<Media>),
+}
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -40,6 +49,28 @@ pub struct BotMessage {
 #[derive(Debug, Deserialize, Clone)]
 pub struct TelegramConfig {
     pub token: String,
+}
+
+#[derive(Debug)]
+pub struct MessageHandled {
+    pub content: Option<MessageContent>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageInfo {
+    pub images: Vec<CoverInfo>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct CoverInfo {
+    #[serde(alias = "imageURL")]
+    pub image_url: ImageURL,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageURL {
+    #[serde(alias = "urlList")]
+    pub url_list: Vec<String>,
 }
 
 impl TelegramConfig {
@@ -139,12 +170,19 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
     Ok(config)
 }
 
+pub fn extract_id_from_url(url: &str) -> Result<&str, MediaDownloaderError> {
+    url.split('/')
+        .last()
+        .ok_or_else(|| MediaDownloaderError::CouldNotExtractId)
+}
+
 /// Reply to client with the requested blob or an error message
 /// # Arguments
 /// * `chat_id` - The chat id to reply to
 /// * `message_id` - The message id to reply to
 /// * `text` - (`Option`) The text to reply with
 /// * `blob` - (`Option`) The blob to reply with
+/// * `images` - (`Option`) The images to reply with
 /// * `api` - The api to use for sending the reply
 /// # Returns
 /// * `Result<(), Box<dyn Error>>` - The result of the operation
@@ -154,12 +192,13 @@ pub async fn reply_message(
     message_id: i32,
     text: Option<String>,
     blob: Option<InputFile>,
+    images: Option<Vec<Media>>,
     api: AsyncApi,
 ) -> Result<(), Box<dyn Error>> {
     debug!("Replying to [{}] @[{}]", message_id, chat_id);
 
-    match (text, blob) {
-        (Some(t), None) => {
+    match (text, blob, images) {
+        (Some(t), None, None) => {
             let send_message_params = SendMessageParams::builder()
                 .chat_id(chat_id)
                 .reply_to_message_id(message_id)
@@ -167,9 +206,10 @@ pub async fn reply_message(
                 .build();
             if let Err(err) = api.send_message(&send_message_params).await {
                 error!("Failed to send message: {err:?}");
+                eprintln!("Failed to send message: {err:?}")
             }
         }
-        (None, Some(b)) => {
+        (None, Some(b), None) => {
             let send_video_params = SendVideoParams::builder()
                 .chat_id(chat_id)
                 .reply_to_message_id(message_id)
@@ -177,28 +217,59 @@ pub async fn reply_message(
                 .build();
             if let Err(err) = api.send_video(&send_video_params).await {
                 error!("Failed to send video: {err:?}");
+                eprintln!("Failed to send video: {err:?}")
             }
         }
-        (Some(_), Some(_)) => {
-            error!("Both text and blob are present!");
+        (None, None, Some(images)) => {
+            let image_chunks: Vec<_> = images.chunks(IMAGE_BATCH_SIZE).collect();
+
+            for (batch_index, image_chunk) in image_chunks.iter().enumerate() {
+                let send_images_params = SendMediaGroupParams::builder()
+                    .chat_id(chat_id)
+                    .reply_to_message_id(message_id)
+                    .media(image_chunk.to_vec()) // Convert the chunk to Vec<InputFile>
+                    .build();
+
+                if let Err(err) = api.send_media_group(&send_images_params).await {
+                    error!(
+                        "Failed to send bulk photos (batch {}): {err:?}",
+                        batch_index
+                    );
+                    eprintln!(
+                        "Failed to send bulk photos (batch {}): {err:?}",
+                        batch_index
+                    )
+                }
+            }
         }
-        (None, None) => {
-            error!("Either text or blob must be specified!");
+        (Some(_), Some(_), Some(_)) => {
+            error!("Text, blob and images are present!");
+            eprintln!("Text, blob and images are present!")
+        }
+        (None, None, None) => {
+            error!("Either text, blob or images must be specified!");
+            eprintln!("Either text, blob or images must be specified!")
+        }
+        _ => {
+            error!("Unknown combination of text, blob and images!");
+            eprintln!("Unknown combination of text, blob and images!")
         }
     }
-
     Ok(())
 }
 
 pub const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
 pub const ROOT_PATH: &str = "./";
 pub const TARGET_DIRECTORY: &str = "/tmp/media_downloaded/";
-pub const BASE_API_URL: &str = "https://api.telegram.org/bot";
+pub const TARGET_DIRECTORY_IMAGES: &str = "images/";
 pub const DEFAULT_REDIS_TTL: usize = 24 * 3600; // 24 hours
 pub const VIDEO_EXTENSIONS_FORMAT: &str = "mp4";
+pub const IMAGE_EXTENSIONS_FORMAT: &str = "jpeg";
 pub const CONFIG_FILE_PATH: &str = "config.toml";
-pub const TIKTOK_DOMAIN: &str = "vm.tiktok.com";
+pub const TIKTOK_GENERAL_DOMAIN: &str = "tiktok.com";
+pub const TIKTOK_MOBILE_DOMAIN: &str = "vm.tiktok.com";
 pub const YOUTUBE_MOBILE: &str = "youtu.be";
+const IMAGE_BATCH_SIZE: usize = 10;
 
 lazy_static! {
     pub static ref CONFIG_FILE_SYNC: Config = {
@@ -232,6 +303,7 @@ pub const CHONK: &str = "🐈";
 
 // File size-related
 pub const MAX_FILE_SIZE: u64 = 50 * 1024 * 1024; // 50MB
+pub const MAX_FILE_SIZE_PHOTO: u64 = 10 * 1024 * 1024; // 10MB
 const KB: f64 = 1024.0;
 const MB: f64 = KB * KB;
 const GB: f64 = KB * KB * KB;
