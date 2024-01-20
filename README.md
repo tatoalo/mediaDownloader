@@ -122,7 +122,7 @@ I've been a fan of [cronitor](https://cronitor.io/) but [healtchecks](https://he
 
 ## License
 
-    Copyright 2023 Alessandro Pogliaghi
+    Copyright 2024 Alessandro Pogliaghi
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
