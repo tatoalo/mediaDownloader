@@ -1,5 +1,6 @@
 use std::error::Error;
 use std::fmt::{self, Display};
+use std::io;
 
 use crate::{CHONK, CROSS_MARK, FAILED, MONKEY, RADIOACTIVE};
 
@@ -11,9 +12,17 @@ pub enum MediaDownloaderError {
     CouldNotExtractId,
     InvalidUrl,
     FileSizeExceeded,
+    ImagesNotDownloaded,
+    IoErrorImagesDirectory(io::Error),
 }
 
 impl Error for MediaDownloaderError {}
+
+impl From<io::Error> for MediaDownloaderError {
+    fn from(error: io::Error) -> Self {
+        MediaDownloaderError::IoErrorImagesDirectory(error)
+    }
+}
 
 impl Display for MediaDownloaderError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -35,6 +44,12 @@ impl Display for MediaDownloaderError {
             }
             MediaDownloaderError::FileSizeExceeded => {
                 write!(f, "{} File size exceeded!", CHONK)
+            }
+            MediaDownloaderError::ImagesNotDownloaded => {
+                write!(f, "{} Images not downloaded, try again!", FAILED)
+            }
+            MediaDownloaderError::IoErrorImagesDirectory(_) => {
+                write!(f, "{} Error creating `images` directory!", MONKEY)
             }
         }
     }
