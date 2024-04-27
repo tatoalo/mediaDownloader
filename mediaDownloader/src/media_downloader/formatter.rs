@@ -14,6 +14,7 @@ pub enum DomainExtracted {
 }
 
 impl UrlFormatter {
+    #[instrument(level = "debug", name = "url_formatter", skip(url))]
     pub fn new(url: &str) -> Self {
         match Url::parse(url) {
             Ok(u) => {
