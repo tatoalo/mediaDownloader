@@ -1,6 +1,5 @@
-use std::collections::HashMap;
-
 use opentelemetry::KeyValue;
+use std::collections::HashMap;
 
 use opentelemetry::sdk::{trace, Resource};
 use opentelemetry_otlp::{HttpExporterBuilder, WithExportConfig};
@@ -27,6 +26,7 @@ pub struct TelemetryConfig {
 pub async fn init_telemetry(service_name: Option<String>) {
     let telemetry_config = &CONFIG_FILE_SYNC.telemetry;
     if !is_telemetry_config_valid(telemetry_config) {
+        warn!("Telemetry config is invalid, skipping initialization.");
         return;
     }
 
@@ -49,8 +49,10 @@ pub async fn init_telemetry(service_name: Option<String>) {
                 .as_ref()
                 .unwrap()
                 .to_string(),
+            service_name.clone(),
         ),
     );
+
 
     // Tracing pipeline
     let tracer = opentelemetry_otlp::new_pipeline()
@@ -59,16 +61,19 @@ pub async fn init_telemetry(service_name: Option<String>) {
         .with_trace_config(
             trace::config().with_resource(Resource::new(vec![KeyValue::new(
                 opentelemetry_semantic_conventions::resource::SERVICE_NAME,
-                service_name,
+                service_name.clone(),
             )])),
         )
+        .with_batch_config(trace::BatchConfig::default().with_max_export_batch_size(512))
         .install_batch(opentelemetry::runtime::Tokio)
         .expect("Error: Failed to initialize the tracer.");
+
 
     let subscriber = Registry::default();
     let level_filter_layer =
         EnvFilter::try_from_default_env().unwrap_or(EnvFilter::new(LEVEL_TRACES));
     let tracing_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+
 
     subscriber
         .with(level_filter_layer)
@@ -76,6 +81,7 @@ pub async fn init_telemetry(service_name: Option<String>) {
         .with(JsonStorageLayer)
         .with(tracing_subscriber::fmt::layer())
         .init();
+
 }
 
 fn is_telemetry_config_valid(telemetry_config: &Option<TelemetryConfig>) -> bool {
@@ -107,9 +113,10 @@ fn is_telemetry_config_valid(telemetry_config: &Option<TelemetryConfig>) -> bool
     true
 }
 
-fn build_headers(api_key: String) -> HashMap<String, String> {
+fn build_headers(api_key: String, dataset: String) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    map.insert("authorization".to_string(), api_key);
+    map.insert("x-honeycomb-team".to_string(), api_key);
+    map.insert("x-honeycomb-dataset".to_string(), dataset.to_string());
     map
 }
 
@@ -126,6 +133,7 @@ fn build_purpose_exporter(
     let http_tracing_exporter = opentelemetry_otlp::new_exporter()
         .http()
         .with_endpoint(endpoint_constructed)
+        .with_http_client(reqwest::Client::default())
         .with_headers(headers);
 
     http_tracing_exporter
