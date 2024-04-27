@@ -1,4 +1,4 @@
 mod processor;
 mod tiktok;
 pub use processor::{route_to_processor, Processor, ProcessorType};
-pub use tiktok::TikTokProcessor;
+pub use tiktok::{AwemeConfig, AwemeHeaders, AwemeParams, TikTokProcessor};
