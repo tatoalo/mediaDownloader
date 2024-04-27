@@ -12,24 +12,43 @@ use mediadownloader::{
     IMAGE_EXTENSIONS_FORMAT, TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES, VIDEO_EXTENSIONS_FORMAT,
 };
 
+use opentelemetry::trace::FutureExt;
 use std::path::Path;
-use tracing::{debug, error, info, instrument, span};
+use tracing::{debug, error, instrument, span, warn};
+use tracing_opentelemetry::OpenTelemetrySpanExt;
 
 #[tokio::main]
+#[instrument(level = "debug", name = "main")]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     init_telemetry(Some("cleaner".to_string())).await;
 
-    let root_span = span!(tracing::Level::DEBUG, "CLEAN");
-    let _enter = root_span.enter();
+    let root_span = span!(tracing::Level::DEBUG, "Clean");
+    let root_span_clone = root_span.clone();
 
     let redis_manager = get_redis_manager().await;
 
-    let videos_dir = Path::new(TARGET_DIRECTORY);
-    let images_dir_string = format!("{}{}", TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES);
-    let images_dir = Path::new(images_dir_string.as_str());
+    let cleaning_videos_task = tokio::spawn(async move {
+        let videos_dir = Path::new(TARGET_DIRECTORY);
+        let _ = tracing::Instrument::instrument(
+            start_cleaning_flow(videos_dir, VIDEO_EXTENSIONS_FORMAT, redis_manager)
+                .with_context(root_span.context()),
+            root_span.clone(),
+        )
+        .await;
+    });
 
-    start_cleaning_flow(videos_dir, VIDEO_EXTENSIONS_FORMAT, redis_manager).await?;
-    start_cleaning_flow(images_dir, IMAGE_EXTENSIONS_FORMAT, redis_manager).await?;
+    let cleaning_images_task = tokio::spawn(async move {
+        let images_dir_string = format!("{}{}", TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES);
+        let images_dir = Path::new(images_dir_string.as_str());
+        let _ = tracing::Instrument::instrument(
+            start_cleaning_flow(images_dir, IMAGE_EXTENSIONS_FORMAT, redis_manager)
+                .with_context(root_span_clone.context()),
+            root_span_clone.clone(),
+        )
+        .await;
+    });
+
+    let _ = tokio::join!(cleaning_videos_task, cleaning_images_task);
 
     // I know, I know, telemetry additional buffer...hang in there :)
     tokio::time::sleep(tokio::time::Duration::from_secs(15)).await;
@@ -47,22 +66,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 /// * `redis_manager` - The Redis manager instance
 /// # Returns
 /// * `Result<(), Box<dyn std::error::Error>>` - The result of the operation
+#[instrument(level = "debug", name = "start_cleaning_flow", skip_all)]
 async fn start_cleaning_flow(
     directory: &Path,
     file_extension: &str,
     redis_manager: &RedisManager,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let files = scan_filesystem(directory, file_extension).await?;
+) -> Result<(), Box<dyn std::error::Error + Send>> {
+    debug!("Starting cleaning flow for directory: {:?}", directory);
+    let files = scan_filesystem(directory, file_extension).await.unwrap();
     debug!("Files: {:?}", files);
-    let metadata = redis_manager.retrieve_metadata().await?;
+    let metadata = redis_manager.retrieve_metadata().await.unwrap();
     debug!("Metadata: {:?}", metadata);
-    compare_fs_remote(files).await?;
+    compare_fs_remote(files).await.unwrap();
     Ok(())
 }
 
-/// Scans the filesystem for files with the `VIDEO_EXTENSIONS_FORMAT` extension
+/// Scans the filesystem for files filtering on the given file extension
 /// # Arguments
 /// * `directory` - The directory to scan
+/// * `file_extension` - The file extension to filter files on
 /// # Returns
 /// * `Result<Vec<String>, Box<dyn std::error::Error>>` - The list of files found
 #[instrument(level = "debug", name = "scan_filesystem", skip(directory))]
@@ -97,12 +119,12 @@ async fn scan_filesystem(
                                 }
                             }
                             _ => {
-                                error!("Could not extract extension for `{:?}`", dir_entry);
+                                warn!("Could not extract extension for `{:?}`", dir_entry);
                             }
                         }
                     }
                     _ => {
-                        info!("Skipping entry: {:?}", e);
+                        warn!("Skipping entry: {:?}", e);
                         continue;
                     }
                 }
