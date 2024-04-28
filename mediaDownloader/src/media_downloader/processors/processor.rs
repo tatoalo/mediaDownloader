@@ -1,5 +1,7 @@
+use std::error::Error;
+
 use super::TikTokProcessor;
-use crate::{TIKTOK_GENERAL_DOMAIN, TIKTOK_MOBILE_DOMAIN};
+use crate::{MessageContent, TIKTOK_GENERAL_DOMAIN, TIKTOK_MOBILE_DOMAIN};
 use async_trait::async_trait;
 use tracing::instrument;
 
@@ -10,7 +12,7 @@ pub enum ProcessorType {
 
 #[async_trait]
 pub trait Processor {
-    async fn process(&mut self);
+    async fn process(&mut self) -> Result<Option<MessageContent>, Box<dyn Error + Send>>;
 }
 
 #[instrument(level = "debug", name = "route_to_processor")]

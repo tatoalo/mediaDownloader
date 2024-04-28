@@ -8,21 +8,26 @@
 
 #[macro_use]
 extern crate tracing;
-use tracing::{debug, error, instrument};
+use tokio::{fs::File, io::AsyncReadExt};
+use tracing::{debug, error, instrument, Instrument};
 
 pub mod media_downloader;
 pub mod services;
 
 use async_once::AsyncOnce;
 use frankenstein::{
-    AsyncApi, AsyncTelegramApi, InputFile, Media, SendMediaGroupParams, SendMessageParams,
-    SendVideoParams,
+    AsyncApi, AsyncTelegramApi, FileUpload, InputFile, InputMediaPhoto, Media,
+    SendMediaGroupParams, SendMessageParams, SendVideoParams,
 };
 use lazy_static::lazy_static;
 use media_downloader::{errors::MediaDownloaderError, site_validator::SupportedSites};
 use serde::{ser::SerializeMap, Deserialize, Serialize};
 use services::{Builder, RedisBuilder, RedisConfig, RedisManager, TelemetryConfig};
-use std::error::Error;
+use std::path::PathBuf;
+use std::time::Duration;
+use std::{collections::HashMap, error::Error};
+
+use crate::media_downloader::processors::{AwemeConfig, AwemeHeaders, AwemeParams};
 
 #[derive(Debug)]
 pub enum MessageContent {
@@ -36,6 +41,7 @@ pub struct Config {
     pub redis: RedisConfig,
     pub supported_sites: SupportedSites,
     pub telemetry: Option<TelemetryConfig>,
+    pub aweme_api: Option<AwemeConfig>,
 }
 
 #[derive(Debug)]
@@ -170,6 +176,7 @@ pub fn load_config(path: &str) -> Result<Config, Box<dyn Error>> {
     Ok(config)
 }
 
+#[instrument(level = "debug", name = "extract_id_from_url")]
 pub fn extract_id_from_url(url: &str) -> Result<&str, MediaDownloaderError> {
     url.split('/')
         .last()
@@ -206,7 +213,6 @@ pub async fn reply_message(
                 .build();
             if let Err(err) = api.send_message(&send_message_params).await {
                 error!("Failed to send message: {err:?}");
-                eprintln!("Failed to send message: {err:?}")
             }
         }
         (None, Some(b), None) => {
@@ -217,7 +223,6 @@ pub async fn reply_message(
                 .build();
             if let Err(err) = api.send_video(&send_video_params).await {
                 error!("Failed to send video: {err:?}");
-                eprintln!("Failed to send video: {err:?}")
             }
         }
         (None, None, Some(images)) => {
@@ -235,27 +240,229 @@ pub async fn reply_message(
                         "Failed to send bulk photos (batch {}): {err:?}",
                         batch_index
                     );
-                    eprintln!(
-                        "Failed to send bulk photos (batch {}): {err:?}",
-                        batch_index
-                    )
                 }
             }
         }
         (Some(_), Some(_), Some(_)) => {
             error!("Text, blob and images are present!");
-            eprintln!("Text, blob and images are present!")
         }
         (None, None, None) => {
             error!("Either text, blob or images must be specified!");
-            eprintln!("Either text, blob or images must be specified!")
         }
         _ => {
             error!("Unknown combination of text, blob and images!");
-            eprintln!("Unknown combination of text, blob and images!")
         }
     }
     Ok(())
+}
+
+#[instrument(level = "debug", name = "download_images_from_map", skip(images))]
+pub async fn download_images_from_map(
+    images: HashMap<i32, String>,
+    id: String,
+) -> Result<i32, Box<dyn Error + Send>> {
+    let num_images = images.len() as i32;
+
+    if !images.is_empty() {
+        let _ =
+            tokio::fs::create_dir_all(format!("{}{}", TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES))
+                .await
+                .map_err(MediaDownloaderError::IoErrorDirectory);
+    }
+
+    let tasks = images.into_iter().map(|(i, url)| {
+        let id_clone = id.to_string();
+        let root_span = span!(tracing::Level::DEBUG, "Image Processing");
+        async move {
+            debug!("Processing image: {}_{}", id_clone, i);
+            match media_downloader::downloader::fetch_resource(&url, None, None, None, None, None)
+                .await
+            {
+                Ok(response) => {
+                    if response.status().is_success() {
+                        match media_downloader::downloader::was_image_already_downloaded(
+                            &id_clone, i,
+                        )
+                        .await
+                        {
+                            true => {
+                                info!("Image `{}_{}` already downloaded!", id_clone, i);
+                                return;
+                            }
+                            false => {}
+                        }
+                        let mut file = match tokio::fs::File::create(format!(
+                            "{}{}{}_{}.jpeg",
+                            TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES, id_clone, i
+                        ))
+                        .await
+                        {
+                            Ok(file) => file,
+                            Err(err) => {
+                                error!("Error creating file: {}", err);
+                                return;
+                            }
+                        };
+
+                        let mut stream = response.bytes_stream();
+                        while let Some(chunk) = futures::StreamExt::next(&mut stream).await {
+                            let chunk = chunk.unwrap();
+                            tokio::io::AsyncWriteExt::write_all(&mut file, &chunk)
+                                .await
+                                .unwrap();
+                        }
+                    } else {
+                        error!(
+                            "Error: Request failed with status code {:?}",
+                            response.status()
+                        );
+                    }
+                }
+                Err(err) => {
+                    error!("Error: {}", err);
+                }
+            }
+        }
+        .instrument(root_span)
+    });
+
+    let join_handles: Vec<_> = tasks.map(|task| tokio::spawn(task)).collect();
+
+    for handle in join_handles {
+        handle.await.unwrap();
+    }
+    Ok(num_images)
+}
+
+// Asynchronously retrieves a specified number of images.
+///
+/// # Arguments
+///
+/// * `url_id` - A string slice that holds the identifier of the URL from which to retrieve images.
+/// * `number_of_images` - The number of images to retrieve.
+///
+/// # Returns
+///
+/// * `Ok(Vec<Media>)` - A vector of `Media` objects, each representing an image, if the images are successfully retrieved.
+/// * `Err(Box<dyn Error + Send>)` - An error, if any occurred during the retrieval of images.
+///
+/// # Errors
+///
+/// This function will return an error if the images cannot be retrieved for any reason (e.g., network issues, invalid URL ID, etc.).
+#[instrument(level = "debug", name = "retrieve_images")]
+async fn retrieve_images(
+    url_id: &str,
+    number_of_images: i32,
+) -> Result<Vec<Media>, Box<dyn Error + Send>> {
+    let mut images = Vec::<Media>::new();
+    let mut io_errors = 0;
+
+    debug!("number_of_images: {}", number_of_images);
+
+    for n in 0..number_of_images {
+        let image_file_name = format!("{}_{}", url_id, n);
+
+        let file_path = format!(
+            "{}{}{}.{}",
+            TARGET_DIRECTORY, TARGET_DIRECTORY_IMAGES, image_file_name, IMAGE_EXTENSIONS_FORMAT
+        );
+        debug!(
+            "Retrieving image for {} in path {}",
+            image_file_name, file_path
+        );
+
+        let mut file = match File::open(&file_path).await {
+            Ok(f) => f,
+            Err(e) => {
+                error!("Error opening file `{}`: {}", file_path, e);
+                debug!("Removing key `{}`", image_file_name);
+                let redis_manager = get_redis_manager().await;
+                let _ = redis_manager.del(&image_file_name).await;
+                io_errors += 1;
+                continue;
+            }
+        };
+
+        let mut buffer = Vec::new();
+        file.read_to_end(&mut buffer).await.unwrap();
+        let file_size = buffer.len() as u64;
+
+        if file_size > MAX_FILE_SIZE_PHOTO {
+            error!(
+                "File size of {} [{}] is greater than {}!",
+                url_id, file_size, MAX_FILE_SIZE_PHOTO
+            );
+            continue;
+        }
+
+        let file_size_h = human_file_size(file_size);
+        debug!("file size of {} = {}", url_id, file_size_h);
+
+        images.push(Media::Photo(InputMediaPhoto {
+            media: FileUpload::InputFile(InputFile {
+                path: PathBuf::from(&file_path),
+            }),
+            caption: None,
+            parse_mode: None,
+            caption_entities: None,
+            has_spoiler: None,
+        }));
+    }
+
+    if images.is_empty() {
+        return Err(Box::new(MediaDownloaderError::ImagesNotDownloaded));
+    }
+
+    debug!("Finished retrieving images!");
+    if io_errors > 0 {
+        error!("Encountered {} IO errors", io_errors);
+    }
+    Ok(images)
+}
+
+/// Retrieves the blob from the fs
+/// If the file is not found, the respective key is removed from Redis
+/// # Arguments
+/// * `url_id` - The id of the video
+/// # Returns
+/// * `InputFile` - The blob to forward to the user
+/// # Errors
+/// * `MediaDownloaderError::BlobRetrievingError` - Error retrieving the blob from the fs
+/// * `MediaDownloaderError::FileSizeExceeded` - File size is greater than the maximum allowed (50MB)
+#[instrument(level = "debug", name = "retrieve_blob", skip(url_id))]
+pub async fn retrieve_blob(url_id: &str) -> Result<InputFile, Box<dyn Error + Send>> {
+    let file_path = format!("{}{}.{}", TARGET_DIRECTORY, url_id, VIDEO_EXTENSIONS_FORMAT);
+    debug!("Retrieving blob for {} in path {}", url_id, file_path);
+
+    let mut file = match File::open(&file_path).await {
+        Ok(f) => f,
+        Err(e) => {
+            error!("Error opening file `{}`: {}", file_path, e);
+            debug!("Removing key `{}`", url_id);
+            let redis_manager = get_redis_manager().await;
+            let _ = redis_manager.del(url_id).await;
+            return Err(Box::new(MediaDownloaderError::BlobRetrievingError));
+        }
+    };
+
+    let mut buffer = Vec::new();
+    file.read_to_end(&mut buffer).await.unwrap();
+    let file_size = buffer.len() as u64;
+
+    if file_size > MAX_FILE_SIZE {
+        error!(
+            "File size of {} [{}] is greater than {}!",
+            url_id, file_size, MAX_FILE_SIZE
+        );
+        return Err(Box::new(MediaDownloaderError::FileSizeExceeded));
+    }
+
+    let file_size_h = human_file_size(file_size);
+    debug!("file size of {} = {}", url_id, file_size_h);
+
+    Ok(InputFile {
+        path: PathBuf::from(&file_path),
+    })
 }
 
 pub const SERVICE_NAME: &str = env!("CARGO_PKG_NAME");
@@ -270,6 +477,9 @@ pub const TIKTOK_GENERAL_DOMAIN: &str = "tiktok.com";
 pub const TIKTOK_MOBILE_DOMAIN: &str = "vm.tiktok.com";
 pub const YOUTUBE_MOBILE: &str = "youtu.be";
 const IMAGE_BATCH_SIZE: usize = 10;
+pub const EXPONENTIAL_BACKOFF_SECONDS: Duration = Duration::from_secs(30);
+pub const BACKOFF_SECONDS: Duration = Duration::from_secs(3);
+pub const RETRIES_ATTEMPTS: u32 = 3;
 
 lazy_static! {
     pub static ref CONFIG_FILE_SYNC: Config = {
@@ -283,6 +493,57 @@ lazy_static! {
     pub static ref TELEGRAM_CONFIG: TelegramConfig = {
         let telegram_config = CONFIG_FILE_SYNC.telegram.clone();
         TelegramConfig::new(telegram_config.token)
+    };
+    pub static ref AWEME_CONFIG: Option<AwemeConfig> = {
+        let aweme_config = match CONFIG_FILE_SYNC.aweme_api.clone() {
+            Some(aweme_config) => aweme_config,
+            None => return None,
+        };
+        let headers = aweme_config.headers;
+        let params = aweme_config.params;
+        Some(AwemeConfig {
+            url: aweme_config.url,
+            app_name: aweme_config.app_name,
+            ua: aweme_config.ua,
+            headers: AwemeHeaders {
+                accept_language: headers.accept_language,
+                accept: headers.accept,
+            },
+            params: AwemeParams {
+                iid: params.iid,
+                app_version: params.app_version,
+                manifest_app_version: params.manifest_app_version,
+                app_name: params.app_name,
+                aid: params.aid,
+                lower_bound: params.lower_bound,
+                upper_bound: params.upper_bound,
+                version_code: params.version_code,
+                device_brand: params.device_brand,
+                device_type: params.device_type,
+                resolution: params.resolution,
+                dpi: params.dpi,
+                os_version: params.os_version,
+                os_api: params.os_api,
+                sys_region: params.sys_region,
+                region: params.region,
+                app_language: params.app_language,
+                language: params.language,
+                timezone_name: params.timezone_name,
+                timezone_offset: params.timezone_offset,
+                ac: params.ac,
+                ac2: params.ac2,
+                ssmix: params.ssmix,
+                os: params.os,
+                app_type: params.app_type,
+                residence: params.residence,
+                host_abi: params.host_abi,
+                locale: params.locale,
+                uoo: params.uoo,
+                op_region: params.op_region,
+                channel: params.channel,
+                is_pad: params.is_pad,
+            },
+        })
     };
     pub static ref REDIS_CHANNEL: String = CONFIG_FILE_SYNC.redis.channel.clone();
 }

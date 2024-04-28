@@ -14,6 +14,7 @@ impl SupportedSites {
         }
     }
 
+    #[instrument(level = "debug", name = "is_supported")]
     pub fn is_supported(&self, site: &str) -> bool {
         self.sites.contains(&site.to_string())
     }

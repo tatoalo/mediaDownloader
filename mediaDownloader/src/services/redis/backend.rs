@@ -170,6 +170,13 @@ impl RedisManager {
         Ok(())
     }
 
+    pub async fn flushdb(&self) -> Result<(), RedisError> {
+        let mut conn = self.manager.get().await.unwrap();
+        let _scan_result: redis::RedisResult<Vec<redis::Value>> =
+            redis::cmd("FLUSHDB").query_async(&mut conn).await;
+        Ok(())
+    }
+
     #[instrument(level = "debug", name = "retrieve_metadata", skip_all)]
     pub async fn retrieve_metadata(&self) -> Result<MetadataArchive, RedisError> {
         let mut conn = self.manager.get().await.unwrap();
@@ -185,15 +192,14 @@ impl RedisManager {
         match bulk_values {
             redis::Value::Bulk(bulk_values) => {
                 if bulk_values.is_empty() {
-                    error!("No keys retrieved!");
+                    warn!("No keys retrieved!");
                 }
                 for value in bulk_values {
                     match value {
                         redis::Value::Data(data) => {
                             let key = std::str::from_utf8(data).unwrap_or(MISSING_REDIS_KEY);
-
                             if key == MISSING_REDIS_KEY {
-                                error!("Key is missing!");
+                                warn!("Key is missing!");
                                 continue;
                             }
 

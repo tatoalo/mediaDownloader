@@ -1,8 +1,12 @@
 use std::error::Error;
 use std::io::{BufRead, BufReader};
 use std::process::{Command, Stdio};
+use std::str::FromStr;
+use std::sync::Arc;
 
+use reqwest::header::{self, HeaderValue};
 use tracing::instrument;
+use url::Url;
 
 use super::errors::MediaDownloaderError;
 use crate::TARGET_DIRECTORY_IMAGES;
@@ -16,7 +20,7 @@ use crate::{
 /// # Arguments
 /// * `url` - The `UrlFormatter` to download
 /// * `url_id` - The ID of the video
-#[instrument(level = "debug", name = "download_video")]
+#[instrument(level = "debug", name = "download_video", skip(url))]
 pub async fn download_video(
     url: &UrlFormatter,
     url_id: String,
@@ -30,8 +34,6 @@ pub async fn download_video(
         }
         false => {}
     }
-
-    debug!("Downloading ID: `{}`", url_id);
 
     let output = Command::new("yt-dlp")
         .arg(url)
@@ -49,12 +51,6 @@ pub async fn download_video(
         .expect("Failure in capturing output!");
 
     if !output.status.success() {
-        error!(
-            "Error: {} ~ {}",
-            String::from_utf8_lossy(&output.stderr),
-            output.status
-        );
-        return Err(Box::new(MediaDownloaderError::BlobRetrievingError));
     }
 
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -62,10 +58,9 @@ pub async fn download_video(
 
     reader
         .lines()
-        // .filter_map(|line| line.ok())
         .map_while(Result::ok)
         .filter(|line| line.contains("[download]"))
-        .for_each(|line| debug!("{}", line));
+        .for_each(|line| debug!("\n{}\n", line));
 
     Ok(())
 }
@@ -105,7 +100,7 @@ pub async fn was_image_already_downloaded(url_id: &str, c: i32) -> bool {
     let redis_manager = get_redis_manager().await;
     let key = &format!("{}_{}", url_id, c);
 
-    println!("Looking up key: {:?}", key);
+    debug!("Looking up key: {:?}", key);
 
     let output_path = format!(
         "{}{}{}_{}.jpeg",
@@ -114,11 +109,10 @@ pub async fn was_image_already_downloaded(url_id: &str, c: i32) -> bool {
 
     match redis_manager.get(key).await {
         Ok(_) => {
-            println!("Key: {:?} present!", key);
+            debug!("Key: {:?} present!", key);
             true
         }
         Err(e) => {
-            println!("Key: {:?} not present!", key);
             warn!("Key: {:?} not present ~ {:?} ", key, e);
             debug!("Setting key {} to {}", key, output_path);
             let _ = redis_manager.set(key, &output_path).await;
@@ -127,7 +121,79 @@ pub async fn was_image_already_downloaded(url_id: &str, c: i32) -> bool {
     }
 }
 
-pub async fn fetch_resource(url: &str) -> Result<reqwest::Response, reqwest::Error> {
-    let response = reqwest::get(url).await?;
+#[instrument(level = "debug", name = "fetch_resource", skip_all)]
+pub async fn fetch_resource(
+    url: &str,
+    query: Option<Vec<(&str, String)>>,
+    referer: Option<&str>,
+    cookies: Option<Vec<(String, Option<Url>)>>,
+    user_agent: Option<String>,
+    headers: Option<Vec<(&str, &str)>>,
+) -> Result<reqwest::Response, reqwest::Error> {
+    let client = reqwest::Client::builder();
+    let mut headers_map = reqwest::header::HeaderMap::new();
+    let jar = Arc::new(reqwest::cookie::Jar::default());
+
+    let ua = if let Some(ua_as_string) = user_agent {
+        ua_as_string.parse::<HeaderValue>().unwrap()
+    } else {
+        retrieve_random_user_agent().await
+    };
+
+    headers_map.insert("user-agent", ua);
+
+    if referer.is_some() {
+        debug!("Injecting referer");
+        headers_map.insert("referer", referer.unwrap().parse().unwrap());
+    }
+
+    if cookies.is_some() {
+        debug!("Injecting cookies");
+        let cookies = cookies.unwrap();
+
+        cookies.iter().for_each(|(cookie_str, u)| {
+            let url = u
+                .as_ref()
+                .map_or_else(|| url::Url::parse(url).unwrap(), |u| u.clone());
+            jar.add_cookie_str(&cookie_str, &url);
+        });
+    }
+
+    if headers.is_some() {
+        debug!("Injecting headers");
+        let headers_unpacked = headers.unwrap();
+
+        headers_unpacked.iter().for_each(|&(header, value)| {
+            headers_map.insert(
+                header::HeaderName::from_str(header).unwrap(),
+                value.parse().unwrap(),
+            );
+        });
+    }
+
+    let response = client
+        .cookie_provider(jar)
+        .build()
+        .unwrap()
+        .get(url)
+        .query(&query)
+        .headers(headers_map)
+        .send()
+        .await?;
+
     Ok(response)
+}
+
+#[instrument(level = "debug", name = "retrieve_random_user_agent")]
+async fn retrieve_random_user_agent() -> HeaderValue {
+    let user_agent = match reqwest::get("https://randua.somespecial.one/").await {
+        Ok(r) => r.text().await.unwrap(),
+        Err(e) => {
+            error!("Error retrieving user agent: {}", e);
+            "user-agent=Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36".to_string()
+        }
+    };
+
+    debug!("Using user agent: {}", user_agent);
+    user_agent.parse().unwrap()
 }
