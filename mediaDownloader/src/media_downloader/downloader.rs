@@ -173,7 +173,6 @@ pub async fn fetch_resource(
 
     let response = client
         .cookie_provider(jar)
-        .gzip(true)
         .build()
         .unwrap()
         .get(url)

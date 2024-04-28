@@ -14,18 +14,20 @@ path = "src/cleaner/cleaner.rs"
 [[bin]]
 name = "bot"
 path = "src/bot/client.rs"
+test = false
 
 [dependencies]
-tokio = { version = "1.26", features = ["full", "tracing"] }
-futures = "0.3.25"
-serde = { version = "1.0.157", features = ["derive"] }
-serde_json = "1.0.108"
-toml = "0.8.8"
-url = "2.3.1"
 redis = { version = "0.24.0", features = [
     "tokio-rustls-comp",
     "connection-manager",
 ] }
+crossbeam = "0.8.4"
+tokio = { version = "1.37", features = ["full", "tracing"] }
+futures = "0.3.30"
+serde = { version = "1.0.199", features = ["derive"] }
+serde_json = "1.0.116"
+toml = "0.8.12"
+url = "2.5.0"
 lazy_static = "1.4.0"
 frankenstein = { version = "0.29.2", default-features = false, features = [
     "async-http-client",
@@ -46,9 +48,15 @@ opentelemetry-otlp = { version = "0.13.0", features = [
 ] }
 tracing-bunyan-formatter = "0.3.9"
 tracing-opentelemetry = "0.21.0"
-opentelemetry-semantic-conventions = "0.12.0"
-reqwest = { version = "0.11.22", features = ["json"] }
-async-trait = "0.1.74"
-scraper = "0.18.1"
-regex = "1.10.2"
-openssl = { version = "0.10.63", features = ["vendored"] }
+opentelemetry-semantic-conventions = "0.14.0"
+reqwest = { version = "0.11.22", features = ["json", "cookies"] }
+async-trait = "0.1.80"
+scraper = "0.19.0"
+regex = "1.10.4"
+tryhard = "0.5.1"
+rand = "0.8.5"
+uuid = { version = "1.8.0", features = ["v4"] }
+cookie = "0.18.1"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10.64", features = ["vendored"] }
