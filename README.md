@@ -77,6 +77,9 @@ sites = [
 [telemetry]
 endpoint = "endpoint"
 api_key = "api_key"
+
+[aweme_api]
+[...]
 ```
 
 #### Telegram 🤖
@@ -97,6 +100,10 @@ The required parameters are:
 #### Supported Sites
 
 The downloader uses a `supported_sites` whitelist to determine admissable sources.
+
+#### Aweme_API
+
+TikTok support 😉
 
 #### Telemetry (Optional)
 
